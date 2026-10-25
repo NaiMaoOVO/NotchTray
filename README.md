@@ -29,13 +29,15 @@
 
 不截图、不落盘：只在面板打开期间在内存里持有图标窗口的即时截图。
 
-## 构建
+## 下载与构建
 
-不依赖 Xcode，只要有 Swift 命令行工具（Xcode Command Line Tools）：
+**下载**：到 [Releases 页面](https://github.com/NaiMaoOVO/NotchTray/releases) 下载最新的 `NotchTray-x.x.x.dmg`，打开后把 NotchTray 拖进「应用程序」文件夹即可（放进去后「登录时启动」才能稳定生效）。
+
+**源码构建**：不依赖 Xcode，只要有 Swift 命令行工具（Xcode Command Line Tools）：
 
 ```bash
 ./build.sh
-# 产物: build/NotchTray.app
+# 产物: build/NotchTray.app + dist/NotchTray-<版本>.dmg
 open build/NotchTray.app
 ```
 
