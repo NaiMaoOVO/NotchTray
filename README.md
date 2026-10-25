@@ -32,6 +32,15 @@
 
 不截图、不落盘：只在面板打开期间在内存里持有图标窗口的即时截图。
 
+## 卸载
+
+1. 右键菜单栏托盘图标 → **退出 NotchTray**（退出时会自动展开菜单栏，各 App 图标的位置由它们自己记忆，无需手动处理）
+2. 把 `/Applications/NotchTray.app` 拖进废纸篓
+3. 可选的残留清理：
+   - `defaults delete local.notchtray`——删除应用设置（排序模式、手动命名、使用频率统计）
+   - 系统设置 › 隐私与安全性 里残留的授权记录可手动移除，或终端执行 `tccutil reset ScreenCapture local.notchtray && tccutil reset Accessibility local.notchtray`
+   - 日志文件 `~/Library/Logs/NotchTray.log`
+
 ## 下载与构建
 
 **下载**：到 [Releases 页面](https://github.com/NaiMaoOVO/NotchTray/releases) 下载最新的 `NotchTray-x.x.x.dmg`，打开后把 NotchTray 拖进「应用程序」文件夹即可（放进去后「登录时启动」才能稳定生效）。

@@ -5,6 +5,7 @@
 // （Control Center 托管、位置钉住、闪现展开截图、启动风暴等待）改编自后者，见 README 致谢。
 
 import AppKit
+import CryptoKit
 import ServiceManagement
 
 @MainActor
@@ -28,11 +29,10 @@ final class StatusBarController {
     /// 下次打开面板若窗口没变（App 没重启）就完全不需要闪现展开
     private struct CachedIcon {
         let image: NSImage
-        let title: String?
-        let button: AXUIElement?
+        /// 图像内容哈希：手动重命名以此为键，跨重启/重建持久
+        let imageKey: String
     }
     private var iconCache: [CGWindowID: CachedIcon] = [:]
-    private var axButtons: [CGWindowID: AXUIElement] = [:]
     private(set) var isCollapsed = false
     // 新图标入库提醒：周期扫描状态层，发现新窗口就在入口图标上亮一个小圆点
     private var scanTimer: Timer?
@@ -259,72 +259,46 @@ final class StatusBarController {
             defer { self.isOpeningPanel = false }
             let windows = MenuBarItemScanner.hiddenItems()
             let uncached = windows.filter { self.iconCache[$0.id] == nil }
-            // 按钮引用会随 Control Center 重建 AX 树而失效，缺失的（含按压失败作废的）需要重抓
-            let needButtons = windows.filter { self.iconCache[$0.id]?.button == nil }
-            if !uncached.isEmpty || !needButtons.isEmpty {
-                // 闪现展开：截图 + AX 名字/按钮引用一次收齐。
-                // 屏幕外的窗口截不到图，AX 按坐标命中也要求屏幕内。
-                NSLog("notchtray: flash-expand for \(uncached.count) new, \(needButtons.count) stale buttons")
+            if !uncached.isEmpty {
+                // 闪现展开只为截图：屏幕外的窗口截不到图。
+                // 名字与按压都走 AXExtrasMenuBar 实时枚举（可离屏），无需闪现。
+                FileLog.write("notchtray: flash-expand for \(uncached.count) new item(s)")
                 applySeparatorLength(collapsed: false)
-                try? await Task.sleep(for: .milliseconds(300))
-                let posMap = StatusBarIdentity.positionMap()
-                let uncachedIDs = Set(uncached.map(\.id))
-                let refreshIDs = Set(needButtons.map(\.id))
-                var titles: [CGWindowID: String] = [:]
-                var buttons: [CGWindowID: AXUIElement] = [:]
-                for window in windows where uncachedIDs.contains(window.id) || refreshIDs.contains(window.id) {
-                    guard let frame = MenuBarItemScanner.frame(of: window.id),
-                          Self.isInMenuBarStrip(frame) else { continue }
-                    if let button = StatusItemAX.buttonElement(at: CGPoint(x: frame.midX, y: frame.midY)) {
-                        buttons[window.id] = button
-                        titles[window.id] = Self.resolveName(for: window, button: button, posMap: posMap)
-                    }
-                }
+                try? await Task.sleep(for: .milliseconds(320))
                 let captured = await ItemCapturer.capture(uncached)
                 for item in captured {
-                    let old = self.iconCache[item.window.id]
                     self.iconCache[item.window.id] = CachedIcon(image: item.image,
-                                                                title: titles[item.window.id] ?? old?.title,
-                                                                button: buttons[item.window.id] ?? old?.button)
-                }
-                // 只补按钮/名字的窗口没有新截图，单独更新缓存
-                for windowID in refreshIDs where !uncachedIDs.contains(windowID) {
-                    guard let old = iconCache[windowID] else { continue }
-                    iconCache[windowID] = CachedIcon(image: old.image,
-                                                     title: titles[windowID] ?? old.title,
-                                                     button: buttons[windowID] ?? old.button)
+                                                                imageKey: Self.imageKey(item.image))
                 }
                 // 闪现期间用户手动展开了菜单栏，则现状归用户所有，不要强行收回去
                 if isCollapsed { applySeparatorLength(collapsed: true) }
             }
             // 截图期间菜单栏被手动展开的话就不再显示面板，避免图标双份出现
             guard isCollapsed else {
-                NSLog("notchtray: bar expanded during capture, not showing the panel")
+                FileLog.write("notchtray: bar expanded during capture, not showing the panel")
                 return
             }
-            // 从缓存组装面板内容（此时所有窗口都应有缓存）
+            // 收起后重新扫描：停靠位置可能与闪现前不同，AX 树匹配要用最新 frame
+            let currentWindows = MenuBarItemScanner.hiddenItems()
+            let scan = currentWindows.isEmpty ? windows : currentWindows
+            iconCache = iconCache.filter { Set(scan.map(\.id)).contains($0.key) } // 清理已退出的 App
             var items: [CapturedItem] = []
-            var axButtons: [CGWindowID: AXUIElement] = [:]
-            let presentIDs = Set(windows.map(\.id))
-            for window in windows {
+            for window in scan {
                 guard let cached = iconCache[window.id] else { continue }
-                items.append(CapturedItem(window: window, image: cached.image))
-                if let button = cached.button { axButtons[window.id] = button }
+                var item = CapturedItem(window: window, image: cached.image)
+                item.label = self.displayName(for: window, cached: cached)
+                items.append(item)
             }
-            iconCache = iconCache.filter { presentIDs.contains($0.key) } // 清理已退出的 App
-            self.axButtons = axButtons
             items.sort { $0.window.frame.minX < $1.window.frame.minX }
-            for (index, item) in items.enumerated() {
-                if let title = iconCache[item.window.id]?.title, !title.isEmpty {
-                    items[index].label = title
-                } else {
-                    items[index].label = Self.label(for: item, index: index)
-                }
+            var fallbackIndex = 0
+            for (index, item) in items.enumerated() where items[index].label.isEmpty {
+                fallbackIndex += 1
+                items[index].label = "未命名图标 \(fallbackIndex)"
             }
             items = organizer.sorted(items)
             hasNewItems = false // 用户已看过面板，清除新图标提示
             updateToggleIcon()
-            NSLog("notchtray: showing panel with \(items.count) items (cache hit \(windows.count - uncached.count), mode \(organizer.sortMode.rawValue))")
+            FileLog.write("notchtray: showing panel with \(items.count) items (cache hit \(scan.count - uncached.count), mode \(organizer.sortMode.rawValue))")
             let anchor = toggleItem.button?.window?.frame ?? anchorFrame
             panel.show(items: items, below: anchor,
                        context: PanelContext(
@@ -332,26 +306,24 @@ final class StatusBarController {
                             resort: { [weak self] list in self?.organizer.sorted(list) ?? list },
                             onSortChange: { [weak self] mode in self?.organizer.setSortMode(mode) },
                             onReorder: { [weak self] labels in self?.organizer.commitManualOrder(labels) },
-                            liveStatus: { [weak self] item in self?.liveStatus(for: item) ?? item.label }),
+                            liveStatus: { [weak self] item in self?.liveStatus(for: item) ?? item.label },
+                            onRename: { [weak self] item in self?.renameFlow(for: item) }),
                        onClick: { [weak self] item in self?.forwardClick(to: item) },
                        onPin: { [weak self] item in self?.pinVisible(item) },
+                       onRename: { [weak self] item in self?.renameFlow(for: item) },
                        onRearrange: { [weak self] in self?.rearrange() })
         }
     }
 
-    /// 悬停时的实时状态：AX 动态读取的标题/描述 + 使用次数
-    private func liveStatus(for item: CapturedItem) -> String {
-        var parts = [item.label]
-        if let button = axButtons[item.window.id],
-           let live = StatusItemAX.title(of: button),
-           !live.isEmpty, live != item.label {
-            parts.append("· " + live)
+    /// 名字解析：手动命名 > AX 标题（extras 树实时读取，可离屏）> 窗口标题 > 空（稍后兜底编号）
+    private func displayName(for window: MenuBarItemWindow, cached: CachedIcon) -> String {
+        if let manual = manualNames[cached.imageKey] { return manual }
+        if let button = StatusItemAX.extrasButton(for: window),
+           let title = StatusItemAX.title(of: button), !Self.isGenericName(title) {
+            return title
         }
-        let uses = organizer.usage(of: item.label)
-        if uses > 0 {
-            parts.append("已点 \(uses) 次")
-        }
-        return parts.joined(separator: "  ")
+        if !Self.isGenericName(window.title) { return window.title }
+        return ""
     }
 
     /// "Item-0"/"Item 12"/"控制中心" 这类名字不是图标自己的名字
@@ -364,24 +336,62 @@ final class StatusBarController {
         return lower == "控制中心" || lower == "control center"
     }
 
-    /// 名字解析：AX 标题 > 窗口标题（过滤通用名）> 偏好位置反查归属 App
-    private static func resolveName(for window: MenuBarItemWindow, button: AXUIElement?,
-                                    posMap: [StatusBarIdentity.Entry]) -> String? {
-        if let ax = button.flatMap({ StatusItemAX.title(of: $0) }), !isGenericName(ax) { return ax }
-        if !isGenericName(window.title) { return window.title }
-        return StatusBarIdentity.name(at: window.frame.minX, in: posMap)
-    }
-
-    /// 兜底名字：窗口标题 > 归属 App（Tahoe 上多是 Control Center，没用）> 未命名
-    private static func label(for item: CapturedItem, index: Int) -> String {
-        if !isGenericName(item.window.title) { return item.window.title }
-        let owner = item.window.ownerName
-        if !isGenericName(owner) { return owner }
-        return "未命名图标 \(index + 1)"
+    /// 悬停时的实时状态：AX 动态读取的标题/描述 + 使用次数
+    private func liveStatus(for item: CapturedItem) -> String {
+        var parts = [item.label]
+        if let button = StatusItemAX.extrasButton(for: item.window),
+           let live = StatusItemAX.title(of: button),
+           !live.isEmpty, live != item.label, !Self.isGenericName(live) {
+            parts.append("· " + live)
+        }
+        let uses = organizer.usage(of: item.label)
+        if uses > 0 {
+            parts.append("已点 \(uses) 次")
+        }
+        return parts.joined(separator: "  ")
     }
 
     private func applySeparatorLength(collapsed: Bool) {
         separatorItem.length = collapsed ? 10_000 : NSStatusItem.variableLength
+    }
+
+    // MARK: - 手动重命名（Tahoe 上匿名图标无公开归属数据，用户命名是最终手段）
+
+    /// 图标图像内容哈希作为键：图标像素不变则键不变，跨重启/重建持久
+    static func imageKey(_ image: NSImage) -> String {
+        let data = image.tiffRepresentation ?? Data()
+        return SHA256.hash(data: data).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private var manualNames: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: "notchtray.manualNames") as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "notchtray.manualNames") }
+    }
+
+    private func renameFlow(for item: CapturedItem) {
+        let alert = NSAlert()
+        alert.messageText = "重命名图标"
+        alert.informativeText = item.label.hasPrefix("未命名")
+            ? "给这个图标起个名字，名字会跟随图标本身，重启后依然生效。"
+            : "当前名字「\(item.label)」。改名后同样跟随图标本身。"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.stringValue = item.label.hasPrefix("未命名") ? "" : item.label
+        alert.accessoryView = field
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+        let key = Self.imageKey(item.image)
+        var names = manualNames
+        if name.isEmpty {
+            names.removeValue(forKey: key)
+        } else {
+            names[key] = name
+        }
+        manualNames = names
+        FileLog.write("notchtray: manual name for \(key) -> \(name.isEmpty ? "(cleared)" : name)")
     }
 
     // MARK: - 点击转发
@@ -396,20 +406,14 @@ final class StatusBarController {
                 beforeOpeningSettings: { ClickForwarder.promptForAccessibility() })
             return
         }
-        // 首选 AXPress：对面板打开时缓存的按钮引用直接执行按下，菜单栏完全不动
-        if let button = axButtons[item.window.id] {
-            if StatusItemAX.press(button) {
-                NSLog("notchtray: AXPress opened item \(item.window.id) without expanding")
-                return
-            }
-            // 引用已失效（Control Center 重建过 AX 树）：作废缓存，下次开面板强制重抓
-            NSLog("notchtray: AXPress failed for \(item.window.id), invalidating cached button")
-            if let cached = iconCache[item.window.id] {
-                iconCache[item.window.id] = CachedIcon(image: cached.image, title: cached.title, button: nil)
-            }
-            axButtons[item.window.id] = nil
+        // 快速路径：从宿主进程 AXExtrasMenuBar 实时枚举按钮并按压（不依赖缓存引用，
+        // 图标在屏幕外也能按），菜单栏完全不动
+        let pressResult = StatusItemAX.pressItem(window: item.window)
+        if pressResult == true {
+            FileLog.write("notchtray: AXPress ok for \(item.window.id) [\(item.label)]")
+            return
         }
-        NSLog("notchtray: falling back to expand + synthetic click")
+        FileLog.write("notchtray: press unavailable/failed (\(String(describing: pressResult))), falling back to expand + synthetic click")
         expand()
         Task { @MainActor [weak self] in
             guard let self else { return }

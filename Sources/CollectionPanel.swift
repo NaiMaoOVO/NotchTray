@@ -28,6 +28,8 @@ struct PanelContext {
     let onReorder: @MainActor ([String]) -> Void
     /// 悬停时取图标实时状态（AX 动态读取 + 使用次数）
     let liveStatus: @MainActor (CapturedItem) -> String
+    /// 手动重命名（匿名图标没有公开归属数据，用户命名是最终手段）
+    let onRename: @MainActor (CapturedItem) -> Void
 }
 
 /// 面板共享状态：AppKit 层（键盘监听）与 SwiftUI 层共读共写
@@ -58,6 +60,7 @@ final class CollectionPanel {
               context: PanelContext,
               onClick: @escaping @MainActor (CapturedItem) -> Void,
               onPin: @escaping @MainActor (CapturedItem) -> Void,
+              onRename: @escaping @MainActor (CapturedItem) -> Void,
               onRearrange: @escaping @MainActor () -> Void) {
         close()
 
@@ -79,6 +82,12 @@ final class CollectionPanel {
                 Task { @MainActor in
                     self?.close()
                     onPin(item)
+                }
+            },
+            onRename: { [weak self] item in
+                Task { @MainActor in
+                    self?.close()
+                    onRename(item)
                 }
             },
             onRearrange: { [weak self] in
@@ -246,6 +255,7 @@ private struct PanelContentView: View {
     let context: PanelContext
     let onClick: (CapturedItem) -> Void
     let onPin: (CapturedItem) -> Void
+    let onRename: (CapturedItem) -> Void
     let onRearrange: () -> Void
     @State private var sortMode: SortMode
     @State private var draggingLabel: String?
@@ -255,11 +265,13 @@ private struct PanelContentView: View {
     init(viewModel: PanelViewModel, context: PanelContext,
          onClick: @escaping (CapturedItem) -> Void,
          onPin: @escaping (CapturedItem) -> Void,
+         onRename: @escaping (CapturedItem) -> Void,
          onRearrange: @escaping () -> Void) {
         self.viewModel = viewModel
         self.context = context
         self.onClick = onClick
         self.onPin = onPin
+        self.onRename = onRename
         self.onRearrange = onRearrange
         _sortMode = State(initialValue: context.sortMode)
     }
@@ -297,6 +309,7 @@ private struct PanelContentView: View {
                             isKeySelected: viewModel.keyboardIndex == index,
                             onClick: onClick,
                             onPin: onPin,
+                            onRename: onRename,
                             onHover: { hovering in
                                 if hovering {
                                     hoverStatus = context.liveStatus(item)
@@ -399,6 +412,7 @@ private struct PanelItemCell: View {
     let isKeySelected: Bool
     let onClick: (CapturedItem) -> Void
     let onPin: (CapturedItem) -> Void
+    let onRename: (CapturedItem) -> Void
     let onHover: (Bool) -> Void
     let onDragStart: () -> Void
     let dropDelegate: ReorderDropDelegate
@@ -448,6 +462,7 @@ private struct PanelItemCell: View {
         .onDrop(of: [UTType.text], delegate: dropDelegate)
         .contextMenu {
             Button("常驻菜单栏（不再收纳）") { onPin(item) }
+            Button("重命名…") { onRename(item) }
         }
         .help(item.label)
         // 位图图标无法被读屏软件识别，用名字补上
