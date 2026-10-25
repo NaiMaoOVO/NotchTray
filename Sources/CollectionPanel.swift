@@ -30,10 +30,26 @@ struct PanelContext {
     let liveStatus: @MainActor (CapturedItem) -> String
 }
 
+/// 面板共享状态：AppKit 层（键盘监听）与 SwiftUI 层共读共写
+@MainActor
+final class PanelViewModel: ObservableObject {
+    @Published var query = ""
+    @Published var items: [CapturedItem] = []
+    @Published var keyboardIndex: Int?
+
+    var filtered: [CapturedItem] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return items }
+        return items.filter { $0.label.localizedCaseInsensitiveContains(q) }
+    }
+}
+
 @MainActor
 final class CollectionPanel {
     private var panel: NSPanel?
     private var monitors: [Any] = []
+    private var viewModel: PanelViewModel?
+    private var activateItem: ((CapturedItem) -> Void)?
     private static let edgeInset: CGFloat = 4
 
     var isVisible: Bool { panel?.isVisible ?? false }
@@ -45,8 +61,13 @@ final class CollectionPanel {
               onRearrange: @escaping @MainActor () -> Void) {
         close()
 
+        let vm = PanelViewModel()
+        vm.items = items
+        self.viewModel = vm
+        self.activateItem = onClick
+
         let hosting = FirstMouseHostingView(rootView: PanelContentView(
-            items: items,
+            viewModel: vm,
             context: context,
             onClick: { [weak self] item in
                 Task { @MainActor in
@@ -106,10 +127,46 @@ final class CollectionPanel {
         }
         if let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
             if event.keyCode == 53 { self?.close(); return nil } // Esc
-            return event
+            return self?.handleKey(event) ?? event
         }) {
             monitors.append(monitor)
         }
+    }
+
+    /// 方向键在网格上移动高亮，回车触发。搜索框有文字时方向键透传给光标
+    private func handleKey(_ event: NSEvent) -> NSEvent? {
+        guard event.type == .keyDown, let vm = viewModel else { return event }
+        let columns = 5
+        let list = vm.filtered
+        guard list.count > 0 else { return event }
+
+        let up = event.keyCode == 126, down = event.keyCode == 125
+        let left = event.keyCode == 123, right = event.keyCode == 124
+        guard up || down || left || right || event.keyCode == 36 else { return event } // 36 = Return
+
+        if event.keyCode == 36 {
+            guard let index = vm.keyboardIndex, list.indices.contains(index) else { return event }
+            let item = list[index]
+            close()
+            activateItem?(item)
+            return nil
+        }
+
+        // 搜索中不打断光标移动
+        if !vm.query.trimmingCharacters(in: .whitespaces).isEmpty { return event }
+
+        var index = vm.keyboardIndex ?? -1
+        switch (up, down, left, right) {
+        case (true, false, false, false): index -= columns
+        case (false, true, false, false): index += columns
+        case (false, false, true, false): index -= 1
+        case (false, false, false, true): index += 1
+        default: break
+        }
+        if index < 0 { index = list.count - 1 } // 环绕
+        if index >= list.count { index = 0 }
+        vm.keyboardIndex = index
+        return nil
     }
 
     static func screenFrame(containing anchor: NSRect, screens: [NSRect]) -> NSRect {
@@ -122,6 +179,8 @@ final class CollectionPanel {
         monitors.removeAll()
         panel?.orderOut(nil)
         panel = nil
+        viewModel = nil
+        activateItem = nil
     }
 }
 
@@ -183,47 +242,40 @@ private struct HintView: View {
 // MARK: - 面板内容（SwiftUI）
 
 private struct PanelContentView: View {
-    @State private var displayItems: [CapturedItem]
+    @ObservedObject var viewModel: PanelViewModel
     let context: PanelContext
     let onClick: (CapturedItem) -> Void
     let onPin: (CapturedItem) -> Void
     let onRearrange: () -> Void
-
-    @State private var query = ""
     @State private var sortMode: SortMode
     @State private var draggingLabel: String?
     @State private var hoverStatus: String?
     @FocusState private var searchFocused: Bool
 
-    init(items: [CapturedItem], context: PanelContext,
+    init(viewModel: PanelViewModel, context: PanelContext,
          onClick: @escaping (CapturedItem) -> Void,
          onPin: @escaping (CapturedItem) -> Void,
          onRearrange: @escaping () -> Void) {
-        _displayItems = State(initialValue: items)
-        _sortMode = State(initialValue: context.sortMode)
+        self.viewModel = viewModel
         self.context = context
         self.onClick = onClick
         self.onPin = onPin
         self.onRearrange = onRearrange
-    }
-
-    private var filtered: [CapturedItem] {
-        let q = query.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return displayItems }
-        return displayItems.filter { $0.label.localizedCaseInsensitiveContains(q) }
+        _sortMode = State(initialValue: context.sortMode)
     }
 
     private let columns = Array(repeating: GridItem(.fixed(76), spacing: 2), count: 5)
 
     var body: some View {
+        let list = viewModel.filtered
         VStack(spacing: 10) {
             HStack(spacing: 8) {
-                Text(displayItems.isEmpty ? "没有隐藏的图标" : "已收纳 \(displayItems.count) 个图标")
+                Text(viewModel.items.isEmpty ? "没有隐藏的图标" : "已收纳 \(viewModel.items.count) 个图标")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
-                if !displayItems.isEmpty {
-                    TextField("搜索", text: $query)
+                if !viewModel.items.isEmpty {
+                    TextField("搜索", text: $viewModel.query)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 12))
                         .frame(width: 120)
@@ -231,22 +283,24 @@ private struct PanelContentView: View {
                 }
             }
 
-            if displayItems.isEmpty {
+            if viewModel.items.isEmpty {
                 Text("右键入口图标选「整理图标…」，按住 ⌘ 把图标拖到 # 左边即可收进这里")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
                     .padding(.vertical, 6)
             } else {
                 LazyVGrid(columns: columns, spacing: 4) {
-                    ForEach(filtered) { item in
+                    ForEach(Array(list.enumerated()), id: \.element.id) { index, item in
                         PanelItemCell(
                             item: item,
                             isDragging: draggingLabel == item.label,
+                            isKeySelected: viewModel.keyboardIndex == index,
                             onClick: onClick,
                             onPin: onPin,
                             onHover: { hovering in
                                 if hovering {
                                     hoverStatus = context.liveStatus(item)
+                                    viewModel.keyboardIndex = nil // 鼠标接管高亮
                                 } else if hoverStatus != nil {
                                     hoverStatus = nil
                                 }
@@ -254,7 +308,7 @@ private struct PanelContentView: View {
                             onDragStart: { draggingLabel = item.label },
                             dropDelegate: ReorderDropDelegate(
                                 target: item,
-                                items: $displayItems,
+                                items: $viewModel.items,
                                 draggingLabel: $draggingLabel
                             ) { labels in
                                 // 拖拽即手动排序：提交顺序并切换模式
@@ -264,7 +318,7 @@ private struct PanelContentView: View {
                         )
                     }
                 }
-                if filtered.isEmpty {
+                if list.isEmpty {
                     Text("无匹配的图标")
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
@@ -282,14 +336,14 @@ private struct PanelContentView: View {
                 .frame(width: 150)
                 .onChange(of: sortMode) { newMode in
                     context.onSortChange(newMode)
-                    displayItems = context.resort(displayItems)
+                    viewModel.items = context.resort(viewModel.items)
                 }
                 Spacer()
                 Button("整理图标…") { onRearrange() }
                     .font(.system(size: 11))
             }
 
-            Text(hoverStatus ?? "点击图标唤起原菜单 · 右键设为常驻 · 拖动可手动排序")
+            Text(hoverStatus ?? "点击图标唤起原菜单 · 右键设为常驻 · 拖动/方向键选择，回车打开")
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -300,6 +354,7 @@ private struct PanelContentView: View {
         .frame(width: 428)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         .onAppear { searchFocused = true }
+        .onChange(of: viewModel.query) { _ in viewModel.keyboardIndex = nil }
     }
 }
 
@@ -341,6 +396,7 @@ private struct ReorderDropDelegate: DropDelegate {
 private struct PanelItemCell: View {
     let item: CapturedItem
     let isDragging: Bool
+    let isKeySelected: Bool
     let onClick: (CapturedItem) -> Void
     let onPin: (CapturedItem) -> Void
     let onHover: (Bool) -> Void
@@ -370,6 +426,12 @@ private struct PanelItemCell: View {
             .background(
                 RoundedRectangle(cornerRadius: 9)
                     .fill(Color.accentColor.opacity(isHovering ? 0.18 : 0))
+            )
+            .overlay(
+                // 键盘导航高亮：描边圆角框
+                RoundedRectangle(cornerRadius: 9)
+                    .strokeBorder(Color.accentColor, lineWidth: isKeySelected ? 2 : 0)
+                    .opacity(isKeySelected ? 0.9 : 0)
             )
             .opacity(isDragging ? 0.35 : 1)
             .contentShape(Rectangle())

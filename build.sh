@@ -30,8 +30,16 @@ cp build/NotchTray "$APP/Contents/MacOS/NotchTray"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
-echo "==> Ad-hoc 签名"
-codesign --force --sign - "$APP"
+echo "==> 签名（稳定身份：TCC 授权在重新编译后依然有效）"
+xattr -cr "$APP"
+# 注意：不能用 security find-identity -v 判断——未受信的自签证书不会被列为 valid，
+# 但 codesign 能正常使用它。直接签名，失败才退回 ad-hoc
+if codesign --force --sign "NotchTray Dev" "$APP" 2>/dev/null; then
+  echo "    已用 NotchTray Dev 证书签名"
+else
+  echo "    （NotchTray Dev 证书不可用，退回 ad-hoc——重新编译会使权限授权失效）"
+  codesign --force --sign - "$APP"
+fi
 
 echo "==> 打包 DMG"
 mkdir -p dist

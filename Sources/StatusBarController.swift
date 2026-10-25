@@ -34,6 +34,10 @@ final class StatusBarController {
     private var iconCache: [CGWindowID: CachedIcon] = [:]
     private var axButtons: [CGWindowID: AXUIElement] = [:]
     private(set) var isCollapsed = false
+    // 新图标入库提醒：周期扫描状态层，发现新窗口就在入口图标上亮一个小圆点
+    private var scanTimer: Timer?
+    private var seenWindowIDs: Set<CGWindowID> = []
+    private var hasNewItems = false
     var hotkeyAvailable = false
 
     init() {
@@ -64,6 +68,29 @@ final class StatusBarController {
         }
 
         scheduleInitialCollapse()
+        startScanLoop()
+    }
+
+    /// 每 15 秒扫一次状态层：发现"新面孔"被收进来时在入口图标上提示。
+    /// 首次扫描只记录基线（启动风暴期间不触发）。
+    private func startScanLoop() {
+        guard Self.legacyModel else { return }
+        scanTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.scanTick() }
+        }
+    }
+
+    private func scanTick() {
+        let current = Set(MenuBarItemScanner.hiddenItems().map(\.id))
+        if !seenWindowIDs.isEmpty {
+            let fresh = current.subtracting(seenWindowIDs)
+            if !fresh.isEmpty {
+                hasNewItems = true
+                updateToggleIcon()
+                NSLog("notchtray: \(fresh.count) new item(s) collected, badge on")
+            }
+        }
+        seenWindowIDs = current
     }
 
     private func configureToggleButton() {
@@ -177,13 +204,27 @@ final class StatusBarController {
 
     private func updateToggleIcon() {
         let name = isCollapsed ? "tray.full" : "tray"
-        toggleItem.button?.image = Self.symbol(name)
+        toggleItem.button?.image = hasNewItems ? Self.badgedSymbol(name) : Self.symbol(name)
         toggleItem.button?.setAccessibilityLabel(isCollapsed ? "打开收纳面板" : "收起图标")
     }
 
     private static func symbol(_ name: String) -> NSImage? {
         let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
         image?.isTemplate = true
+        return image
+    }
+
+    /// 基础符号 + 右上角小圆点（有新图标入库的提示）
+    private static func badgedSymbol(_ name: String) -> NSImage? {
+        guard let base = symbol(name) else { return nil }
+        let size = NSSize(width: 18, height: 18)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        base.draw(in: NSRect(origin: .zero, size: size))
+        NSColor.systemRed.setFill()
+        NSBezierPath(ovalIn: NSRect(x: 11, y: 10, width: 6, height: 6)).fill()
+        image.unlockFocus()
+        image.isTemplate = false // 保持红点醒目
         return image
     }
 
@@ -270,6 +311,8 @@ final class StatusBarController {
                 }
             }
             items = organizer.sorted(items)
+            hasNewItems = false // 用户已看过面板，清除新图标提示
+            updateToggleIcon()
             NSLog("notchtray: showing panel with \(items.count) items (cache hit \(windows.count - uncached.count), mode \(organizer.sortMode.rawValue))")
             let anchor = toggleItem.button?.window?.frame ?? anchorFrame
             panel.show(items: items, below: anchor,
