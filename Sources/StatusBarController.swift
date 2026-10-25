@@ -259,29 +259,40 @@ final class StatusBarController {
             defer { self.isOpeningPanel = false }
             let windows = MenuBarItemScanner.hiddenItems()
             let uncached = windows.filter { self.iconCache[$0.id] == nil }
-            if !uncached.isEmpty {
-                // 只为新出现的图标闪现展开：截图 + AX 名字/按钮引用一次收齐。
+            // 按钮引用会随 Control Center 重建 AX 树而失效，缺失的（含按压失败作废的）需要重抓
+            let needButtons = windows.filter { self.iconCache[$0.id]?.button == nil }
+            if !uncached.isEmpty || !needButtons.isEmpty {
+                // 闪现展开：截图 + AX 名字/按钮引用一次收齐。
                 // 屏幕外的窗口截不到图，AX 按坐标命中也要求屏幕内。
-                NSLog("notchtray: flash-expand for \(uncached.count) new item(s)")
+                NSLog("notchtray: flash-expand for \(uncached.count) new, \(needButtons.count) stale buttons")
                 applySeparatorLength(collapsed: false)
                 try? await Task.sleep(for: .milliseconds(300))
+                let posMap = StatusBarIdentity.positionMap()
+                let uncachedIDs = Set(uncached.map(\.id))
+                let refreshIDs = Set(needButtons.map(\.id))
                 var titles: [CGWindowID: String] = [:]
                 var buttons: [CGWindowID: AXUIElement] = [:]
-                for window in uncached {
+                for window in windows where uncachedIDs.contains(window.id) || refreshIDs.contains(window.id) {
                     guard let frame = MenuBarItemScanner.frame(of: window.id),
                           Self.isInMenuBarStrip(frame) else { continue }
                     if let button = StatusItemAX.buttonElement(at: CGPoint(x: frame.midX, y: frame.midY)) {
                         buttons[window.id] = button
-                        if let title = StatusItemAX.title(of: button) {
-                            titles[window.id] = title
-                        }
+                        titles[window.id] = Self.resolveName(for: window, button: button, posMap: posMap)
                     }
                 }
                 let captured = await ItemCapturer.capture(uncached)
                 for item in captured {
+                    let old = self.iconCache[item.window.id]
                     self.iconCache[item.window.id] = CachedIcon(image: item.image,
-                                                                title: titles[item.window.id],
-                                                                button: buttons[item.window.id])
+                                                                title: titles[item.window.id] ?? old?.title,
+                                                                button: buttons[item.window.id] ?? old?.button)
+                }
+                // 只补按钮/名字的窗口没有新截图，单独更新缓存
+                for windowID in refreshIDs where !uncachedIDs.contains(windowID) {
+                    guard let old = iconCache[windowID] else { continue }
+                    iconCache[windowID] = CachedIcon(image: old.image,
+                                                     title: titles[windowID] ?? old.title,
+                                                     button: buttons[windowID] ?? old.button)
                 }
                 // 闪现期间用户手动展开了菜单栏，则现状归用户所有，不要强行收回去
                 if isCollapsed { applySeparatorLength(collapsed: true) }
@@ -343,13 +354,28 @@ final class StatusBarController {
         return parts.joined(separator: "  ")
     }
 
-    /// 面板里的名字：窗口标题（需屏幕录制权限，通常是图标的辅助功能名）>
-    /// 窗口归属 App（Tahoe 上全是 Control Center，没用）> 兜底编号
+    /// "Item-0"/"Item 12" 这类窗口通用名不是真名
+    private static func isGenericName(_ name: String?) -> Bool {
+        guard let name else { return true }
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return true }
+        return trimmed.range(of: #"^Item[- ]?\d+$"#, options: .regularExpression) != nil
+    }
+
+    /// 名字解析：AX 标题 > 窗口标题（过滤通用名）> 偏好位置反查归属 App
+    private static func resolveName(for window: MenuBarItemWindow, button: AXUIElement?,
+                                    posMap: [StatusBarIdentity.Entry]) -> String? {
+        if let ax = button.flatMap({ StatusItemAX.title(of: $0) }), !isGenericName(ax) { return ax }
+        if !isGenericName(window.title) { return window.title }
+        return StatusBarIdentity.name(at: window.frame.minX, in: posMap)
+    }
+
+    /// 兜底名字：窗口标题 > 归属 App（Tahoe 上多是 Control Center，没用）> 未命名
     private static func label(for item: CapturedItem, index: Int) -> String {
-        if !item.window.title.isEmpty { return item.window.title }
+        if !isGenericName(item.window.title) { return item.window.title }
         let owner = item.window.ownerName
         if !owner.isEmpty && owner != "Control Center" { return owner }
-        return "图标 \(index + 1)"
+        return "未命名图标 \(index + 1)"
     }
 
     private func applySeparatorLength(collapsed: Bool) {
@@ -369,11 +395,19 @@ final class StatusBarController {
             return
         }
         // 首选 AXPress：对面板打开时缓存的按钮引用直接执行按下，菜单栏完全不动
-        if let button = axButtons[item.window.id], StatusItemAX.press(button) {
-            NSLog("notchtray: AXPress opened item \(item.window.id) without expanding")
-            return
+        if let button = axButtons[item.window.id] {
+            if StatusItemAX.press(button) {
+                NSLog("notchtray: AXPress opened item \(item.window.id) without expanding")
+                return
+            }
+            // 引用已失效（Control Center 重建过 AX 树）：作废缓存，下次开面板强制重抓
+            NSLog("notchtray: AXPress failed for \(item.window.id), invalidating cached button")
+            if let cached = iconCache[item.window.id] {
+                iconCache[item.window.id] = CachedIcon(image: cached.image, title: cached.title, button: nil)
+            }
+            axButtons[item.window.id] = nil
         }
-        NSLog("notchtray: AXPress unavailable, falling back to expand + synthetic click")
+        NSLog("notchtray: falling back to expand + synthetic click")
         expand()
         Task { @MainActor [weak self] in
             guard let self else { return }
