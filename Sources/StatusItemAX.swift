@@ -86,33 +86,98 @@ enum StatusItemAX {
     }
 }
 
-/// 匿名状态图标的身份反查：macOS 会把每个状态图标的 x 坐标
-/// 以 "NSStatusItem Preferred Position <名>" 存进归属 App 的偏好域，
-/// 读出来按坐标匹配就能把窗口映射回 App（沙盒 App 的域读不到，尽力而为）
+/// 匿名状态图标的身份反查。macOS 把每个状态图标的"距右边缘距离"存进
+/// 归属 App 偏好域的 "NSStatusItem Preferred Position <名>" 键；
+/// 换算成屏幕绝对 x 后按坐标匹配，把窗口映射回归属 App。
+/// 覆盖：运行中 App 的常规域 + 沙盒 App 的容器 plist（苹果系域跳过）
 @MainActor
 enum StatusBarIdentity {
     struct Entry {
-        let x: CGFloat
+        /// 存档值：距所在屏右边缘的点数（值越大越靠左）
+        let stored: CGFloat
         let name: String
     }
 
+    private static var cache: (entries: [Entry], at: Date)?
+    private static let cacheTTL: TimeInterval = 60
+    /// 换算误差容忍：存档值与绝对坐标之间隔着图标宽度等未知偏移
+    private static let tolerance: CGFloat = 26
+
     static func positionMap() -> [Entry] {
+        if let cache, Date().timeIntervalSince(cache.at) < cacheTTL { return cache.entries }
         var entries: [Entry] = []
         for app in NSWorkspace.shared.runningApplications {
             guard let bundleID = app.bundleIdentifier,
-                  let defaults = UserDefaults(suiteName: bundleID) else { continue }
-            for (key, value) in defaults.dictionaryRepresentation()
-            where key.hasPrefix("NSStatusItem Preferred Position ") {
-                guard let x = value as? Double, x > 0, x < 20_000 else { continue }
-                entries.append(Entry(x: CGFloat(x), name: app.localizedName ?? bundleID))
-            }
+                  !bundleID.hasPrefix("com.apple."), bundleID != "local.notchtray"
+            else { continue }
+            appendDomain(bundleID, displayName: app.localizedName ?? bundleID, into: &entries)
         }
+        scanContainers(into: &entries)
+        NSLog("notchtray: position map has \(entries.count) entries")
+        cache = (entries, Date())
         return entries
     }
 
-    static func name(at x: CGFloat, in entries: [Entry]) -> String? {
-        guard let closest = entries.min(by: { abs($0.x - x) < abs($1.x - x) }),
-              abs(closest.x - x) < 12 else { return nil }
+    /// windowX 为 CG 全局绝对坐标（原点左上，X 轴同 AppKit）
+    static func name(at windowX: CGFloat, in entries: [Entry]) -> String? {
+        guard let screen = NSScreen.screens.first else { return nil }
+        let maxX = screen.frame.maxX
+        guard let closest = entries.min(by: {
+            abs(maxX - $0.stored - windowX) < abs(maxX - $1.stored - windowX)
+        }), abs(maxX - closest.stored - windowX) <= tolerance else { return nil }
         return closest.name
+    }
+
+    private static func appendDomain(_ bundleID: String, displayName: String, into entries: inout [Entry]) {
+        guard let defaults = UserDefaults(suiteName: bundleID) else { return }
+        for (key, value) in defaults.dictionaryRepresentation()
+        where key.hasPrefix("NSStatusItem Preferred Position ") {
+            if let x = value as? Double, x > 0, x < 4_000 {
+                entries.append(Entry(stored: CGFloat(x), name: displayName))
+            }
+        }
+    }
+
+    /// 沙盒 App 的偏好存在 ~/Library/Containers/<...>/Data/Library/Preferences/<bundle-id>.plist，
+    /// 直接读 plist 文件（目录名可能是 UUID，但 plist 文件名一定是 bundle id）
+    private static func scanContainers(into entries: inout [Entry]) {
+        let fm = FileManager.default
+        let containers = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Containers")
+        guard let dirs = try? fm.contentsOfDirectory(at: containers, includingPropertiesForKeys: nil) else { return }
+        for dir in dirs {
+            let prefs = dir.appendingPathComponent("Data/Library/Preferences")
+            guard let files = try? fm.contentsOfDirectory(at: prefs, includingPropertiesForKeys: nil) else { continue }
+            for file in files where file.pathExtension == "plist" {
+                let bundleID = file.deletingPathExtension().lastPathComponent
+                guard !bundleID.hasPrefix("com.apple."), bundleID != "local.notchtray",
+                      let dict = NSDictionary(contentsOf: file) as? [String: Any] else { continue }
+                var matched = false
+                for (key, value) in dict where key.hasPrefix("NSStatusItem Preferred Position ") {
+                    if let x = value as? Double, x > 0, x < 4_000 {
+                        entries.append(Entry(stored: CGFloat(x), name: displayName(forBundleID: bundleID)))
+                        matched = true
+                    }
+                }
+                _ = matched
+            }
+        }
+    }
+
+    static func displayName(forBundleID bundleID: String) -> String {
+        if let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleID }),
+           let name = app.localizedName { return name }
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            let fm = FileManager.default
+            let shown = fm.displayName(atPath: url.path)
+            if !shown.isEmpty && shown != url.deletingPathExtension().lastPathComponent {
+                return shown
+            }
+            if let bundle = Bundle(url: url),
+               let name = (bundle.infoDictionary?["CFBundleDisplayName"] as? String)
+                   ?? (bundle.infoDictionary?["CFBundleName"] as? String) {
+                return name
+            }
+        }
+        return bundleID
     }
 }

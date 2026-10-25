@@ -354,12 +354,14 @@ final class StatusBarController {
         return parts.joined(separator: "  ")
     }
 
-    /// "Item-0"/"Item 12" 这类窗口通用名不是真名
+    /// "Item-0"/"Item 12"/"控制中心" 这类名字不是图标自己的名字
     private static func isGenericName(_ name: String?) -> Bool {
         guard let name else { return true }
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty { return true }
-        return trimmed.range(of: #"^Item[- ]?\d+$"#, options: .regularExpression) != nil
+        if trimmed.range(of: #"^Item[- ]?\d+$"#, options: .regularExpression) != nil { return true }
+        let lower = trimmed.lowercased()
+        return lower == "控制中心" || lower == "control center"
     }
 
     /// 名字解析：AX 标题 > 窗口标题（过滤通用名）> 偏好位置反查归属 App
@@ -374,7 +376,7 @@ final class StatusBarController {
     private static func label(for item: CapturedItem, index: Int) -> String {
         if !isGenericName(item.window.title) { return item.window.title }
         let owner = item.window.ownerName
-        if !owner.isEmpty && owner != "Control Center" { return owner }
+        if !isGenericName(owner) { return owner }
         return "未命名图标 \(index + 1)"
     }
 

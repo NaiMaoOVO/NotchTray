@@ -46,6 +46,12 @@ mkdir -p dist
 rm -f "dist/NotchTray-$VERSION.dmg"
 hdiutil create -volname "NotchTray" -srcfolder "$APP" -ov -format UDZO "dist/NotchTray-$VERSION.dmg" -quiet
 
+echo "==> 安装到 /Applications（启动台可见；先优雅退出运行中的实例）"
+osascript -e 'tell application id "local.notchtray" to quit' >/dev/null 2>&1 || true
+sleep 1
+ditto "$APP" /Applications/NotchTray.app
+
 echo "==> 完成:"
 echo "    $APP"
 echo "    dist/NotchTray-$VERSION.dmg"
+echo "    /Applications/NotchTray.app"

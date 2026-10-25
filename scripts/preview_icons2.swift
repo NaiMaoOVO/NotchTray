@@ -132,26 +132,44 @@ do {
     write(img, "F2-face")
 }
 
-// F3 · 原创演绎 · 收纳进行时：彩色圆点正被"吸"进刘海口袋
+// F3 · 原创演绎 · 刘海旁的独立收纳盘：刘海条 + 右侧一个独立的小插件盘，
+// 彩点正从屏幕飞进盘里（强调"独立工具"，不是在刘海里整理）
 do {
     let img = canvas()
     let card = drawBase(img)
-    let pocketW = card.width * 0.70, pocketH = card.height * 0.24
-    let pocketRect = NSRect(x: card.midX - pocketW / 2, y: card.minY + card.height * 0.16,
-                            width: pocketW, height: pocketH)
-    // 三个圆点：一颗已在口袋里（被盖住），一颗正在落入，一颗还在空中
-    let cd = card.width * 0.20
-    dot(CGPoint(x: card.midX, y: pocketRect.maxY - pocketH * 0.15), diameter: cd, color: tabBlue)   // 半入口袋
-    dot(CGPoint(x: card.midX - card.width * 0.26, y: pocketRect.maxY + card.height * 0.06),
-        diameter: cd, color: tabRed)                                                                 // 正在落
-    dot(CGPoint(x: card.midX + card.width * 0.27, y: pocketRect.maxY + card.height * 0.30),
-        diameter: cd * 0.85, color: tabYellow)                                                       // 空中
-    // 口袋最后画，把"半入"的圆盖住
-    rounded(pocketRect, radius: pocketH * 0.55, color: inkDark)
-    // 口袋开口高光
-    let slit = NSRect(x: pocketRect.minX + pocketW * 0.14, y: pocketRect.maxY - pocketH * 0.16,
-                      width: pocketW * 0.72, height: pocketH * 0.09)
-    rounded(slit, radius: slit.height * 0.5, color: NSColor.white.withAlphaComponent(0.22))
+    // 刘海条：卡片顶部中央
+    let barW = card.width * 0.60, barH = card.height * 0.155
+    let barY = card.maxY - card.height * 0.115 - barH
+    rounded(NSRect(x: card.midX - barW / 2, y: barY, width: barW, height: barH),
+            radius: barH * 0.55, color: inkDark)
+    // 独立小盘：右下方，与刘海条明显分离
+    let trayW = card.width * 0.38, trayH = card.height * 0.30
+    let trayRect = NSRect(x: card.maxX - card.width * 0.105 - trayW,
+                          y: card.minY + card.height * 0.115,
+                          width: trayW, height: trayH)
+    NSGraphicsContext.saveGraphicsState()
+    let shadow = NSShadow()
+    shadow.shadowColor = NSColor.black.withAlphaComponent(0.35)
+    shadow.shadowOffset = NSSize(width: 0, height: -S * 0.008)
+    shadow.shadowBlurRadius = S * 0.018
+    shadow.set()
+    rounded(trayRect, radius: trayH * 0.44, color: inkDark)
+    NSGraphicsContext.restoreGraphicsState()
+    // 盘里的三颗彩点
+    let d = trayRect.height * 0.21
+    for (i, color) in [tabRed, tabYellow, tabGreen].enumerated() {
+        dot(CGPoint(x: trayRect.minX + trayW * (0.24 + CGFloat(i) * 0.26),
+                    y: trayRect.midY), diameter: d, color: color)
+    }
+    // 一颗蓝点正从刘海方向飞进小盘（动势线：两个渐小的拖影）
+    let flyY = (barY + trayRect.maxY) / 2
+    dot(CGPoint(x: card.midX + card.width * 0.10, y: flyY), diameter: card.width * 0.105, color: tabBlue)
+    dot(CGPoint(x: card.midX + card.width * 0.015, y: flyY + card.height * 0.035),
+        diameter: card.width * 0.055, color: tabBlue.withAlphaComponent(0.45))
+    // 左下角留白处补一颗小灰点（屏幕上"还在外面"的图标）
+    dot(CGPoint(x: card.minX + card.width * 0.17, y: card.minY + card.height * 0.20),
+        diameter: card.width * 0.075,
+        color: NSColor(calibratedWhite: 0.55, alpha: 1))
     write(img, "F3-swallow")
 }
 
