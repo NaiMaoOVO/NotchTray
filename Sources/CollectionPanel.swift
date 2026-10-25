@@ -1,10 +1,11 @@
-// 收纳面板：入口图标下方弹出的下拉面板，网格展示所有被收纳的图标，支持搜索。
-// 窗口机制（无边框 NSPanel + acceptsFirstMouse + 全局点击关闭）参考
-// menubar-hide (github.com/junior-rj/menubar-hide, MIT) 的 HiddenItemsPanel，见 README 致谢。
-// 面板内容为 NotchTray 原创的搜索 + 网格布局。
+// 收纳面板：入口图标下方弹出的下拉面板，网格展示所有被收纳的图标。
+// 支持：搜索、三种排序（频率/栏序/手动）、面板内拖拽排序、悬停查看实时状态、
+// 右键设为常驻。窗口机制（无边框 NSPanel + acceptsFirstMouse + 全局点击关闭）
+// 参考 menubar-hide (github.com/junior-rj/menubar-hide, MIT)，见 README 致谢。
 
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 // 无边框窗口默认拒绝成为 key window；不成为 key，按钮和 Esc 监听都是死的。
 // .nonactivatingPanel 让 LSUIElement 应用在面板持有键盘焦点时也不抢占前台（Spotlight 同款机制）。
@@ -17,6 +18,18 @@ private final class FirstMouseHostingView<Content: View>: NSHostingView<Content>
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
+/// 控制器注入面板的排序/状态能力
+struct PanelContext {
+    let sortMode: SortMode
+    /// 用当前模式给列表排序（控制器侧持有 IconOrganizer）
+    let resort: @MainActor ([CapturedItem]) -> [CapturedItem]
+    let onSortChange: @MainActor (SortMode) -> Void
+    /// 手动拖拽结束，提交顺序
+    let onReorder: @MainActor ([String]) -> Void
+    /// 悬停时取图标实时状态（AX 动态读取 + 使用次数）
+    let liveStatus: @MainActor (CapturedItem) -> String
+}
+
 @MainActor
 final class CollectionPanel {
     private var panel: NSPanel?
@@ -26,6 +39,7 @@ final class CollectionPanel {
     var isVisible: Bool { panel?.isVisible ?? false }
 
     func show(items: [CapturedItem], below anchorFrame: NSRect,
+              context: PanelContext,
               onClick: @escaping @MainActor (CapturedItem) -> Void,
               onPin: @escaping @MainActor (CapturedItem) -> Void,
               onRearrange: @escaping @MainActor () -> Void) {
@@ -33,6 +47,7 @@ final class CollectionPanel {
 
         let hosting = FirstMouseHostingView(rootView: PanelContentView(
             items: items,
+            context: context,
             onClick: { [weak self] item in
                 Task { @MainActor in
                     self?.close()
@@ -168,17 +183,34 @@ private struct HintView: View {
 // MARK: - 面板内容（SwiftUI）
 
 private struct PanelContentView: View {
-    let items: [CapturedItem]
+    @State private var displayItems: [CapturedItem]
+    let context: PanelContext
     let onClick: (CapturedItem) -> Void
     let onPin: (CapturedItem) -> Void
     let onRearrange: () -> Void
+
     @State private var query = ""
+    @State private var sortMode: SortMode
+    @State private var draggingLabel: String?
+    @State private var hoverStatus: String?
     @FocusState private var searchFocused: Bool
+
+    init(items: [CapturedItem], context: PanelContext,
+         onClick: @escaping (CapturedItem) -> Void,
+         onPin: @escaping (CapturedItem) -> Void,
+         onRearrange: @escaping () -> Void) {
+        _displayItems = State(initialValue: items)
+        _sortMode = State(initialValue: context.sortMode)
+        self.context = context
+        self.onClick = onClick
+        self.onPin = onPin
+        self.onRearrange = onRearrange
+    }
 
     private var filtered: [CapturedItem] {
         let q = query.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return items }
-        return items.filter { $0.label.localizedCaseInsensitiveContains(q) }
+        guard !q.isEmpty else { return displayItems }
+        return displayItems.filter { $0.label.localizedCaseInsensitiveContains(q) }
     }
 
     private let columns = Array(repeating: GridItem(.fixed(76), spacing: 2), count: 5)
@@ -186,11 +218,11 @@ private struct PanelContentView: View {
     var body: some View {
         VStack(spacing: 10) {
             HStack(spacing: 8) {
-                Text(items.isEmpty ? "没有隐藏的图标" : "已收纳 \(items.count) 个图标")
+                Text(displayItems.isEmpty ? "没有隐藏的图标" : "已收纳 \(displayItems.count) 个图标")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
-                if !items.isEmpty {
+                if !displayItems.isEmpty {
                     TextField("搜索", text: $query)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 12))
@@ -199,7 +231,7 @@ private struct PanelContentView: View {
                 }
             }
 
-            if items.isEmpty {
+            if displayItems.isEmpty {
                 Text("右键入口图标选「整理图标…」，按住 ⌘ 把图标拖到 # 左边即可收进这里")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
@@ -207,7 +239,29 @@ private struct PanelContentView: View {
             } else {
                 LazyVGrid(columns: columns, spacing: 4) {
                     ForEach(filtered) { item in
-                        PanelItemCell(item: item, onClick: onClick, onPin: onPin)
+                        PanelItemCell(
+                            item: item,
+                            isDragging: draggingLabel == item.label,
+                            onClick: onClick,
+                            onPin: onPin,
+                            onHover: { hovering in
+                                if hovering {
+                                    hoverStatus = context.liveStatus(item)
+                                } else if hoverStatus != nil {
+                                    hoverStatus = nil
+                                }
+                            },
+                            onDragStart: { draggingLabel = item.label },
+                            dropDelegate: ReorderDropDelegate(
+                                target: item,
+                                items: $displayItems,
+                                draggingLabel: $draggingLabel
+                            ) { labels in
+                                // 拖拽即手动排序：提交顺序并切换模式
+                                context.onReorder(labels)
+                                sortMode = .manual
+                            }
+                        )
                     }
                 }
                 if filtered.isEmpty {
@@ -218,14 +272,29 @@ private struct PanelContentView: View {
                 }
             }
 
-            HStack {
+            HStack(spacing: 8) {
+                Picker("排序", selection: $sortMode) {
+                    ForEach(SortMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 150)
+                .onChange(of: sortMode) { newMode in
+                    context.onSortChange(newMode)
+                    displayItems = context.resort(displayItems)
+                }
+                Spacer()
                 Button("整理图标…") { onRearrange() }
                     .font(.system(size: 11))
-                Spacer()
-                Text("点击图标唤起原菜单 · 右键图标设为常驻")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
             }
+
+            Text(hoverStatus ?? "点击图标唤起原菜单 · 右键设为常驻 · 拖动可手动排序")
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
         .padding(12)
         .frame(width: 428)
@@ -234,10 +303,49 @@ private struct PanelContentView: View {
     }
 }
 
+// MARK: - 拖拽重排
+
+private struct ReorderDropDelegate: DropDelegate {
+    let target: CapturedItem
+    @Binding var items: [CapturedItem]
+    @Binding var draggingLabel: String?
+    let commit: ([String]) -> Void
+
+    private func index(of label: String) -> Int? {
+        items.firstIndex { $0.label == label }
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard let dragging = draggingLabel, dragging != target.label,
+              let from = index(of: dragging), let to = index(of: target.label)
+        else { return }
+        withAnimation(.easeInOut(duration: 0.15)) {
+            items.move(fromOffsets: IndexSet(integer: from),
+                       toOffset: to > from ? to + 1 : to)
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingLabel = nil
+        commit(items.map(\.label))
+        return true
+    }
+}
+
+// MARK: - 图标格子
+
 private struct PanelItemCell: View {
     let item: CapturedItem
+    let isDragging: Bool
     let onClick: (CapturedItem) -> Void
     let onPin: (CapturedItem) -> Void
+    let onHover: (Bool) -> Void
+    let onDragStart: () -> Void
+    let dropDelegate: ReorderDropDelegate
     @State private var isHovering = false
 
     var body: some View {
@@ -263,10 +371,19 @@ private struct PanelItemCell: View {
                 RoundedRectangle(cornerRadius: 9)
                     .fill(Color.accentColor.opacity(isHovering ? 0.18 : 0))
             )
+            .opacity(isDragging ? 0.35 : 1)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
+        .onHover { hovering in
+            isHovering = hovering
+            onHover(hovering)
+        }
+        .onDrag {
+            onDragStart()
+            return NSItemProvider(object: item.label as NSString)
+        }
+        .onDrop(of: [UTType.text], delegate: dropDelegate)
         .contextMenu {
             Button("常驻菜单栏（不再收纳）") { onPin(item) }
         }

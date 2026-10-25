@@ -19,6 +19,7 @@ final class StatusBarController {
     private let separatorItem: NSStatusItem
     private let panel = CollectionPanel()
     private let hint = HintPanel()
+    private let organizer = IconOrganizer()
     private var initialCollapseTask: Task<Void, Never>?
     private var autoCollapseMonitor: Any?
     private var autoCollapseTask: Task<Void, Never>?
@@ -268,13 +269,35 @@ final class StatusBarController {
                     items[index].label = Self.label(for: item, index: index)
                 }
             }
-            NSLog("notchtray: showing panel with \(items.count) items (cache hit \(windows.count - uncached.count))")
+            items = organizer.sorted(items)
+            NSLog("notchtray: showing panel with \(items.count) items (cache hit \(windows.count - uncached.count), mode \(organizer.sortMode.rawValue))")
             let anchor = toggleItem.button?.window?.frame ?? anchorFrame
             panel.show(items: items, below: anchor,
+                       context: PanelContext(
+                            sortMode: organizer.sortMode,
+                            resort: { [weak self] list in self?.organizer.sorted(list) ?? list },
+                            onSortChange: { [weak self] mode in self?.organizer.setSortMode(mode) },
+                            onReorder: { [weak self] labels in self?.organizer.commitManualOrder(labels) },
+                            liveStatus: { [weak self] item in self?.liveStatus(for: item) ?? item.label }),
                        onClick: { [weak self] item in self?.forwardClick(to: item) },
                        onPin: { [weak self] item in self?.pinVisible(item) },
                        onRearrange: { [weak self] in self?.rearrange() })
         }
+    }
+
+    /// 悬停时的实时状态：AX 动态读取的标题/描述 + 使用次数
+    private func liveStatus(for item: CapturedItem) -> String {
+        var parts = [item.label]
+        if let button = axButtons[item.window.id],
+           let live = StatusItemAX.title(of: button),
+           !live.isEmpty, live != item.label {
+            parts.append("· " + live)
+        }
+        let uses = organizer.usage(of: item.label)
+        if uses > 0 {
+            parts.append("已点 \(uses) 次")
+        }
+        return parts.joined(separator: "  ")
     }
 
     /// 面板里的名字：窗口标题（需屏幕录制权限，通常是图标的辅助功能名）>
@@ -293,6 +316,7 @@ final class StatusBarController {
     // MARK: - 点击转发
 
     private func forwardClick(to item: CapturedItem) {
+        organizer.recordUse(of: item.label)
         guard ClickForwarder.isTrusted() else {
             showPermissionAlert(
                 message: "需要「辅助功能」权限",
